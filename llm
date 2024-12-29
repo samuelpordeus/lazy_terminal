@@ -1,0 +1,222 @@
+#!/bin/bash
+
+# Check for API key in environment
+if [ -z "$ANTHROPIC_API_KEY" ]; then
+    echo "Error: ANTHROPIC_API_KEY environment variable is not set"
+    echo "Please set it with: export ANTHROPIC_API_KEY='your-api-key'"
+    exit 1
+fi
+
+# Check for jq
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is required but not installed."
+    echo "Please install it with: brew install jq"
+    exit 1
+fi
+
+# Configuration
+MODEL="claude-3-sonnet-20240229"
+API_URL="https://api.anthropic.com/v1/messages"
+VERBOSE=false
+FILE_CONTENT=""
+OS_TYPE="OSX"  # Default OS type
+HISTORY_COUNT=0  # Default to no history
+
+# Function to escape string for JSON
+json_escape() {
+    printf '%s' "$1" | jq -Rs .
+}
+
+# Function to get recent command history
+get_recent_history() {
+    # Determine shell and history file
+    if [ -n "$ZSH_VERSION" ]; then
+        HISTFILE="${HISTFILE:-$HOME/.zsh_history}"
+        # For zsh, use tail and parse the format, removing timestamps completely
+        tail -n 50 "$HISTFILE" 2>/dev/null |
+        while IFS= read -r line; do
+            # Remove timestamps and any other metadata, keeping only the command
+            cmd=$(echo "$line" | sed -E 's/^: [0-9]+:[0-9]+;//')
+            # Only output if it's not an llm command and not empty
+            if [[ -n "$cmd" && ! "$cmd" =~ ^llm ]]; then
+                echo "$cmd"
+            fi
+        done
+    else
+        HISTFILE="${HISTFILE:-$HOME/.bash_history}"
+        # For bash, read lines and filter
+        tail -n 50 "$HISTFILE" 2>/dev/null |
+        while IFS= read -r line; do
+            if [[ -n "$line" && ! "$line" =~ ^llm ]]; then
+                echo "$line"
+            fi
+        done
+    fi |
+    # Take only the last 5 commands
+    tail -n 5 |
+    # Reverse the order (most recent last)
+    tac
+}
+
+# Function to call Claude API
+call_claude() {
+    local prompt=$1
+    local history=$2
+
+    # Start with OS information
+    local full_prompt="Operating System: $OS_TYPE
+"
+    # Only add history if HISTORY_COUNT > 0
+    if [ "$HISTORY_COUNT" -gt 0 ] && [ -n "$history" ]; then
+        full_prompt+="
+Recent command history:
+$history
+
+"
+    fi
+
+    if [ -n "$FILE_CONTENT" ]; then
+        full_prompt+="
+File content:
+$FILE_CONTENT
+
+"
+    fi
+
+    full_prompt+="Based on this context, generate only the exact terminal command (no explanation):
+$prompt"
+
+    # Show prompt if verbose mode is enabled
+    if [ "$VERBOSE" = true ]; then
+        echo -e "\nSending prompt to Claude:"
+        echo "----------------------------------------"
+        echo "$full_prompt"
+        echo "----------------------------------------"
+    fi
+
+    # Escape the full prompt for JSON
+    local escaped_prompt=$(json_escape "$full_prompt")
+
+    # Prepare the API request with history context
+    response=$(curl -s "$API_URL" \
+        -H "x-api-key: $ANTHROPIC_API_KEY" \
+        -H "anthropic-version: 2023-06-01" \
+        -H "content-type: application/json" \
+        -d '{
+            "model": "'"$MODEL"'",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": '"$escaped_prompt"'
+                }
+            ]
+        }')
+
+    # Extract just the command text from the response and remove any leading/trailing whitespace
+    command=$(echo "$response" | jq -r '.content[0].text' | tr -d '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+    # Debug: Print raw response if command is empty, null, or equals the input
+    if [ -z "$command" ] || [ "$command" = "null" ] || [ "$command" = "$prompt" ]; then
+        echo "Debug - Raw API response:" >&2
+        echo "$response" | jq '.' >&2
+        return 1
+    fi
+
+    echo "$command"
+}
+
+# Function to show usage
+show_usage() {
+    echo "Usage: llm [-v|--verbose] [-f|--file <filepath>] [--os <ostype>] [-h <number>] <your request>"
+    echo "Options:"
+    echo "  -v, --verbose    Show the prompt being sent to Anthropic"
+    echo "  -f, --file       Specify a file to include in the context"
+    echo "  --os            Specify the OS type (default: OSX)"
+    echo "  -h, --history   Number of recent commands to include (default: 0)"
+    echo "  --help          Show this help message"
+    exit 1
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -f|--file)
+            if [ -n "$2" ] && [ -f "$2" ]; then
+                FILE_CONTENT=$(cat "$2")
+                shift 2
+            else
+                echo "Error: File not found or not specified"
+                exit 1
+            fi
+            ;;
+        --os)
+            if [ -n "$2" ]; then
+                OS_TYPE="$2"
+                shift 2
+            else
+                echo "Error: OS type not specified"
+                exit 1
+            fi
+            ;;
+        -h|--history)
+            if [ -n "$2" ] && [[ "$2" =~ ^[0-9]+$ ]]; then
+                HISTORY_COUNT=$2
+                shift 2
+            else
+                echo "Error: History count must be a number"
+                exit 1
+            fi
+            ;;
+        --help)
+            show_usage
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Check if we have a prompt
+if [ $# -eq 0 ]; then
+    show_usage
+fi
+
+# Combine remaining arguments as the prompt
+prompt="$*"
+
+# Get recent history only if HISTORY_COUNT > 0
+recent_history=""
+if [ "$HISTORY_COUNT" -gt 0 ]; then
+    recent_history=$(get_recent_history | tail -n "$HISTORY_COUNT")
+    if [ "$VERBOSE" = true ]; then
+        echo "Debug: Raw history retrieved:"
+        echo "$recent_history"
+        echo "----------------------------------------"
+    fi
+fi
+
+# Get the command from Claude
+generated_command=$(call_claude "$prompt" "$recent_history")
+exit_code=$?
+
+if [ $exit_code -ne 0 ] || [ -z "$generated_command" ]; then
+    echo "Error: Failed to generate command"
+    exit 1
+fi
+
+# Display and confirm
+echo -e "\nGenerated command:"
+echo "----------------------------------------"
+echo "$generated_command"
+echo "----------------------------------------"
+echo -n "Execute this command? [Y/n] "
+read -r confirm
+
+if [[ "$confirm" =~ ^[Yy]$ ]] || [ -z "$confirm" ]; then
+    eval "$generated_command"
+fi
